@@ -38,6 +38,10 @@ typedef enum {
 static QueueHandle_t xCmdQueue   = NULL;
 static QueueHandle_t xEventQueue = NULL;
 
+/* Danh sach ID co van tay (doc bang lenh READ_INDEX). Task AS608 ghi, task khac doc
+ * qua vTaskAS608GetIndex(): ca 2 phia deu nam trong critical section. */
+static uint8_t       ucIndexMap[AS608_INDEX_BYTES];
+
 static void          vTaskAS608(void *pvParameters);
 static void          prvSendEvent(AS608_EventType eType, uint16_t usId, uint16_t usValue);
 static void          prvStartup(void);
@@ -55,6 +59,7 @@ static void          prvReenroll(uint16_t usId);
 static void          prvLookup(void);
 static void          prvDeleteId(uint16_t usId);
 static void          prvEmpty(void);
+static void          prvReadIndex(void);
 
 /* ================== Ham public ================== */
 
@@ -84,6 +89,17 @@ BaseType_t xTaskAS608SendCommand(AS608_CmdType eCmd, uint16_t usId, TickType_t x
 BaseType_t xTaskAS608GetEvent(AS608_Event *pxEvent, TickType_t xTicksToWait)
 {
     return xQueueReceive(xEventQueue, pxEvent, xTicksToWait);
+}
+
+void vTaskAS608GetIndex(uint8_t *pucBitmap)
+{
+    uint16_t i;
+
+    taskENTER_CRITICAL();
+    for (i = 0; i < AS608_INDEX_BYTES; i++) {
+        pucBitmap[i] = ucIndexMap[i];
+    }
+    taskEXIT_CRITICAL();
 }
 
 /* ================== Ham noi bo ================== */
@@ -188,6 +204,9 @@ static void prvHandleCommand(const AS608_Command *pxCmd, AS608_State *peState)
         break;
     case AS608_CMD_EMPTY:
         prvEmpty();
+        break;
+    case AS608_CMD_READ_INDEX:
+        prvReadIndex();
         break;
     default:
         break;                               /* lenh la: bo qua */
@@ -519,6 +538,53 @@ static void prvEmpty(void)
     } else {
         prvSendEvent(AS608_EVT_ERROR, AS608_ID_ALL, (uint16_t)eEmpty);
     }
+}
+
+/* READ_INDEX: doc bang chi muc tung trang (32 byte = 256 o), dung mang bit danh sach ID.
+ * Dung tam o mang cuc bo, chep vao ucIndexMap 1 lan trong critical section. */
+static void prvReadIndex(void)
+{
+    uint8_t       ucTable[32];
+    uint8_t       ucMap[AS608_INDEX_BYTES];
+    uint8_t       ucPage;
+    uint8_t       ucTry;
+    uint16_t      usPos;
+    uint16_t      usId;
+    uint16_t      usCount = 0;
+    IdxTbl_Status eStatus = IdxTbl_COMM_ERR;
+
+    for (usPos = 0; usPos < AS608_INDEX_BYTES; usPos++) {
+        ucMap[usPos] = 0;
+    }
+
+    for (ucPage = 0; ucPage < AS608_IDX_PAGES; ucPage++) {
+        for (ucTry = 0; ucTry < AS608_RETRY; ucTry++) {
+            eStatus = as608_ReadIndexTable(ucPage, ucTable);
+            if (eStatus == IdxTbl_OK) {
+                break;
+            }
+            vTaskDelay(AS608_RETRY_DELAY_MS / portTICK_RATE_MS);
+        }
+        if (eStatus != IdxTbl_OK) {
+            prvSendEvent(AS608_EVT_ERROR, 0, (uint16_t)eStatus);
+            return;
+        }
+        for (usPos = 0; usPos < 256U; usPos++) {
+            usId = (uint16_t)(ucPage * 256U + usPos);
+            if (usId < AS608_MAX_ID && idx_is_used(ucTable, (uint8_t)usPos) != 0) {
+                ucMap[usId / 8U] = (uint8_t)(ucMap[usId / 8U] | (1U << (usId % 8U)));
+                usCount++;
+            }
+        }
+    }
+
+    taskENTER_CRITICAL();
+    for (usPos = 0; usPos < AS608_INDEX_BYTES; usPos++) {
+        ucIndexMap[usPos] = ucMap[usPos];
+    }
+    taskEXIT_CRITICAL();
+
+    prvSendEvent(AS608_EVT_INDEX_READY, usCount, 0);
 }
 
 /* ================== Than task ================== */

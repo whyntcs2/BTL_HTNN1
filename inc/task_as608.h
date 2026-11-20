@@ -5,13 +5,18 @@
  * - Chi task nay duoc goi ham as608_... (thu vien goc giu nguyen).
  * - Task khac gui lenh bang xTaskAS608SendCommand()
  *   va nhan ket qua bang xTaskAS608GetEvent().
- * Day du lenh: PAUSE, RESUME, ENROLL, CANCEL, REENROLL, DELETE_ID, LOOKUP, EMPTY. */
+ * Day du lenh: PAUSE, RESUME, ENROLL, CANCEL, REENROLL, DELETE_ID, LOOKUP, EMPTY, READ_INDEX. */
 
 #include "FreeRTOS.h"
 #include <stdint.h>
 
 /* usId cua AS608_EVT_DELETED khi da xoa toan bo thu vien (lenh EMPTY) */
 #define AS608_ID_ALL    0xFFFFU
+
+/* Mang bit danh sach ID dang co van tay (lenh READ_INDEX): bit i = 1 la ID i co mau.
+ * Byte i/8, bit i%8. 300 ID -> 38 byte. */
+#define AS608_MAX_ID        300U
+#define AS608_INDEX_BYTES   ((AS608_MAX_ID + 7U) / 8U)
 
 /* ================== Lenh task khac gui vao ================== */
 typedef enum {
@@ -22,7 +27,8 @@ typedef enum {
     AS608_CMD_REENROLL,     /* lam lai van tay, giu nguyen ID: usId = ID can lam lai */
     AS608_CMD_DELETE_ID,    /* xoa nguoi: usId = ID can xoa */
     AS608_CMD_LOOKUP,       /* tra: dat tay, bao ngon nay la ID may (khong mo cua) */
-    AS608_CMD_EMPTY         /* xoa TOAN BO thu vien (menu phai hoi xac nhan truoc) */
+    AS608_CMD_EMPTY,        /* xoa TOAN BO thu vien (menu phai hoi xac nhan truoc) */
+    AS608_CMD_READ_INDEX    /* doc danh sach ID dang co van tay (them 20/11, menu danh sach) */
 } AS608_CmdType;
 
 typedef struct {
@@ -47,7 +53,8 @@ typedef enum {
     AS608_EVT_DELETED,      /* da xoa, usId = ID da xoa (AS608_ID_ALL: xoa toan bo) */
     AS608_EVT_LOOKUP_RESULT,/* ket qua tra, usId = ID, usValue = diem (KHONG phai mo cua) */
     AS608_EVT_NOT_FOUND,    /* tra: ngon nay khong co trong thu vien */
-    AS608_EVT_TIMEOUT       /* tra: het gio ma khong dat tay */
+    AS608_EVT_TIMEOUT,      /* tra: het gio ma khong dat tay */
+    AS608_EVT_INDEX_READY   /* READ_INDEX xong, usId = so ID co van tay; lay mang bit bang vTaskAS608GetIndex() */
 } AS608_EventType;
 
 /* Buoc dang ky (usValue cua AS608_EVT_ENROLL_STEP) */
@@ -87,5 +94,10 @@ BaseType_t xTaskAS608SendCommand(AS608_CmdType eCmd, uint16_t usId, TickType_t x
 /* Lay 1 su kien, cho toi da xTicksToWait tick.
  * Tra ve pdPASS neu co su kien trong *pxEvent. */
 BaseType_t xTaskAS608GetEvent(AS608_Event *pxEvent, TickType_t xTicksToWait);
+
+/* Chep mang bit danh sach ID (AS608_INDEX_BYTES byte) vao pucBitmap.
+ * Goi SAU khi nhan AS608_EVT_INDEX_READY. Chep trong critical section (slide p2)
+ * de khong doc dung luc task AS608 dang ghi. */
+void vTaskAS608GetIndex(uint8_t *pucBitmap);
 
 #endif /* TASK_AS608_H */
