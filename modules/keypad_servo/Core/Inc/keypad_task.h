@@ -9,10 +9,13 @@
 
 /* Dùng kiểu bool cùng hai giá trị true/false của thư viện chuẩn C. */
 #include <stdbool.h>
+#include <stdint.h> /* Kiểu bộ đếm phím bị bỏ khi FIFO nội bộ cũng đầy. */
+
+#define KEYPAD_PENDING_LENGTH 16U /* Số ký tự chờ gửi, lưu trong stack của KeypadTask. */
 
 /*
  * Khai báo kiểu con trỏ hàm chuyển một ký tự cho phía nhận. Hàm do người ghép Main cung cấp,
- * không chờ: trả true khi đã nhận phím, false để keypad thử lại khi còn giữ phím.
+ * không chờ: true nghĩa là đã nhận phím; false giữ nguyên đầu FIFO để thử lại cả sau khi nhả.
  */
 typedef bool (*KeypadSendKey_t)(char key, void *context);
 
@@ -27,5 +30,9 @@ typedef struct /* Bắt đầu cấu trúc tham số, chỉ mô tả cách bàn 
  * chạy; dùng biến static hoặc toàn cục. Gọi Keypad_Init trước khi chạy task.
  */
 void KeypadTask(void *argument);
+
+/* FIFO đầy thì bỏ ký tự mới, không ghi đè ký tự cũ. Main có thể đọc bộ đếm này
+ * để báo quá tải/xóa chuỗi PIN đang nhập. Chỉ tạo một KeypadTask cho một ma trận. */
+uint32_t KeypadTask_GetDroppedKeys(void);
 
 #endif /* Kết thúc phạm vi bảo vệ header keypad_task.h. */
