@@ -44,6 +44,7 @@ typedef struct {
 static QueueHandle_t log_queue, event_queue, reply_queue; /* Ba chiều trao đổi riêng. */
 static Comm_Users names;                       /* Bảng tên đang dùng và bảng nhận dở. */
 static uint32_t boot_id, event_counter, rejected_logs; /* Định danh và thống kê log lỗi. */
+static UBaseType_t staged_logs;                /* Bản Main đang giữ bằng Comm_LogBuffer. */
 static uint32_t clock_epoch;                   /* Giờ UTC ở thời điểm clock_tick. */
 static TickType_t clock_tick;                  /* Tick tương ứng với clock_epoch. */
 static BaseType_t clock_valid, ota_quiet;       /* Cờ đồng bộ giờ và cờ ngừng truyền OTA. */
@@ -86,33 +87,75 @@ BaseType_t xTaskCommCreate(UBaseType_t priority)
     return pdPASS; /* Phải gọi API này trước khi scheduler bắt đầu. */
 }
 
-BaseType_t xTaskCommLog(uint16_t user, uint8_t method, uint8_t result,
-                       uint8_t door, uint8_t reason)
+static BaseType_t prvMakeLog(Comm_Log *record, uint16_t user, uint8_t method,
+                            uint8_t result, uint8_t door, uint8_t reason)
 {
-    Comm_Log record; /* Queue chép struct, không giữ con trỏ tới biến cục bộ. */
-    BaseType_t sent;
     if (log_queue == NULL || ota_quiet || event_counter == UINT32_MAX ||
         method < 1U || method > 3U || result > 2U || door > 2U) {
         rejected_logs++; /* Main nhận pdFAIL để biết log chưa được tiếp nhận. */
         return pdFAIL;
     }
-    memset(&record, 0, sizeof(record)); /* Không có giờ thì epoch giữ bằng 0. */
-    record.device = COMM_DEVICE_ID;
+    memset(record, 0, sizeof(*record)); /* Không có giờ thì epoch giữ bằng 0. */
+    record->device = COMM_DEVICE_ID;
     taskENTER_CRITICAL(); /* Comm có thể cập nhật đồng hồ khi Main tạo log. */
-    record.event = ((uint64_t)boot_id << 32) | ++event_counter;
-    record.time_quality = clock_valid ? 1U : 0U;
+    record->event = ((uint64_t)boot_id << 32) | ++event_counter;
+    record->time_quality = clock_valid ? 1U : 0U;
     if (clock_valid) {
-        record.epoch = clock_epoch +
+        record->epoch = clock_epoch +
             (uint32_t)((TickType_t)(xTaskGetTickCount() - clock_tick) / configTICK_RATE_HZ);
     }
     taskEXIT_CRITICAL();
-    record.user = user;       /* FFFF nếu không xác định được người dùng. */
-    record.method = method;   /* 1: vân tay; 2: PIN; 3: hệ thống. */
-    record.result = result;   /* 0: thất bại; 1: thành công; 2: cảnh báo. */
-    record.door = door;       /* Trạng thái lệnh cửa, không phải số đo cảm biến. */
-    record.reason = reason;   /* Mã lý do do nhóm thống nhất, không chứa PIN. */
+    record->user = user;       /* FFFF nếu không xác định được người dùng. */
+    record->method = method;   /* 1: vân tay; 2: PIN; 3: hệ thống. */
+    record->result = result;   /* 0: thất bại; 1: thành công; 2: cảnh báo. */
+    record->door = door;       /* Trạng thái lệnh cửa, không phải số đo cảm biến. */
+    record->reason = reason;   /* Mã lý do do nhóm thống nhất, không chứa PIN. */
+    return pdPASS;
+}
+
+BaseType_t xTaskCommLog(uint16_t user, uint8_t method, uint8_t result,
+                       uint8_t door, uint8_t reason)
+{
+    Comm_Log record;
+    BaseType_t sent;
+    /* Không cho API cũ đưa bản mới vượt trước bản Main đang giữ để thử lại. */
+    if (staged_logs != 0) { rejected_logs++; return pdFAIL; }
+    if (prvMakeLog(&record, user, method, result, door, reason) != pdPASS) { return pdFAIL; }
     sent = xQueueSendToBack(log_queue, &record, 0); /* Không chặn Main khi queue đầy. */
     if (sent != pdPASS) { rejected_logs++; }
+    return sent;
+}
+
+BaseType_t xTaskCommLogPrepare(Comm_LogBuffer *buffer, uint16_t user, uint8_t method,
+                             uint8_t result, uint8_t door, uint8_t reason)
+{
+    if (buffer == NULL || buffer->pending) {
+        rejected_logs++; /* Không ghi đè bản Main chưa chuyển được cho Comm. */
+        return pdFAIL;
+    }
+    if (prvMakeLog(&buffer->record, user, method, result, door, reason) != pdPASS) { return pdFAIL; }
+    taskENTER_CRITICAL();
+    buffer->pending = pdTRUE;
+    staged_logs++; /* Tính cả bản này khi xét còn log trước OTA. */
+    taskEXIT_CRITICAL();
+    return pdPASS;
+}
+
+BaseType_t xTaskCommLogFlush(Comm_LogBuffer *buffer)
+{
+    BaseType_t sent;
+    if (buffer == NULL) { rejected_logs++; return pdFAIL; }
+    if (!buffer->pending) { return pdPASS; } /* Gọi lại sau thành công không tạo bản trùng. */
+    if (log_queue == NULL || ota_quiet) { rejected_logs++; return pdFAIL; }
+    taskENTER_CRITICAL(); /* Chuyển quyền giữ và cập nhật tổng số log trong cùng một lượt. */
+    sent = xQueueSendToBack(log_queue, &buffer->record, 0);
+    if (sent == pdPASS) {
+        buffer->pending = pdFALSE;
+        staged_logs--;
+    } else {
+        rejected_logs++; /* Queue đầy: giữ nguyên record và pending để Main thử lại. */
+    }
+    taskEXIT_CRITICAL();
     return sent;
 }
 
@@ -123,7 +166,11 @@ uint32_t ulTaskCommRejectedLogs(void)
 
 UBaseType_t uxTaskCommPendingLogs(void)
 {
-    return log_queue != NULL ? uxQueueMessagesWaiting(log_queue) : 0;
+    UBaseType_t count;
+    taskENTER_CRITICAL();
+    count = staged_logs + (log_queue != NULL ? uxQueueMessagesWaiting(log_queue) : 0);
+    taskEXIT_CRITICAL();
+    return count;
 }
 
 BaseType_t xTaskCommGetEvent(Comm_Event *event, TickType_t wait)
@@ -179,7 +226,7 @@ static void prvCancelOta(Comm_Ota *ota, BaseType_t send_abort)
 }
 
 static void prvPublish(Comm_Ota *ota, Comm_Notices *notices, BaseType_t link,
-                       BaseType_t *reported_link)
+                       BaseType_t *reported_link, BaseType_t *reported_full)
 {
     Comm_Event event = {0};
     event.sequence = ota->sequence;
@@ -196,6 +243,17 @@ static void prvPublish(Comm_Ota *ota, Comm_Notices *notices, BaseType_t link,
         event.sequence = 0;
         if (xQueueSendToBack(event_queue, &event, 0) != pdPASS) { return; }
         *reported_link = link; /* Chỉ ghi đã báo khi queue nhận thành công. */
+    }
+    {
+        UBaseType_t count = uxQueueMessagesWaiting(log_queue);
+        BaseType_t full = count >= COMM_LOG_QUEUE_LEN;
+        if (full != *reported_full) {
+            memset(&event, 0, sizeof(event));
+            event.type = COMM_EVT_LOG_QUEUE;
+            event.value = count; /* Main được báo khi queue đầy và khi có chỗ trở lại. */
+            if (xQueueSendToBack(event_queue, &event, 0) != pdPASS) { return; }
+            *reported_full = full;
+        }
     }
     if (notices->has_status &&
         xQueueSendToBack(event_queue, &notices->status, 0) == pdPASS) {
@@ -225,6 +283,7 @@ static void vTaskComm(void *argument)
     uint8_t byte, attempts = 0;
     unsigned budget;
     BaseType_t has_pending = pdFALSE, reported_link = pdFALSE, seen_peer = pdFALSE, link;
+    BaseType_t reported_full = pdFALSE;
     (void)argument; /* Task không cần tham số khởi động. */
     CommUart_Start(xTaskGetCurrentTaskHandle()); /* Scheduler đã chạy, giờ mới bật IRQ. */
     for (;;) {
@@ -335,7 +394,7 @@ static void vTaskComm(void *argument)
             if (prvSend(&outgoing)) { ota.wire_abort = pdFALSE; }
         }
         link = seen_peer && (TickType_t)(now - last_peer) < prvTicks(COMM_LINK_TIMEOUT_MS);
-        prvPublish(&ota, &notices, link, &reported_link);
+        prvPublish(&ota, &notices, link, &reported_link, &reported_full);
         if (ota.phase == OTA_CANCELLING && !ota.abort && !ota.wire_abort) {
             ota.phase = OTA_IDLE; /* Hủy cũ đã vào queue trước mọi PREPARE mới. */
         }
