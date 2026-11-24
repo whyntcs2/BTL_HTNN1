@@ -18,7 +18,7 @@ typedef enum {
 } AS608_Status;
 
 /* Cong UART dang noi voi AS608, dat qua as608_init() */
-static USART_TypeDef *as608_uart = USART1;
+static USART_TypeDef *as608_uart = AS608_UART;
 
 static void         as608_send_cmd(uint8_t cmd, const uint8_t *params, uint16_t param_len);
 static AS608_Status as608_recv_ack(uint8_t *rx, uint16_t *rx_len);
